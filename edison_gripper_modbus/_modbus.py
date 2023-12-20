@@ -41,14 +41,12 @@ class ModbusCommandsProcessor:
         data: data received from the modbus device
         '''
         if data[0] != self._slave_id:
-            # raise ValueError(f'Received data from slave {data[0]}, expected slave {self._slave_id}')
-            raise ValueError('Received data from slave {}, expected slave {}'.format(data[0], self._slave_id))
+            raise ValueError('Received data for slave {}, expected id: {}'.format(data[0], self._slave_id))
         try:
             command = ModbusCommandsEnum(data[1])
         except IndexError:
             raise ValueError('Received data is too short')
         except ValueError:
-            # raise ValueError(f'Received unsupported command: {data[1]}')
             raise ValueError('Received unsupported command: {}'.format(data[1]))
         
         method_to_call = {
@@ -56,10 +54,8 @@ class ModbusCommandsProcessor:
             ModbusCommandsEnum.READ_INPUT_REGISTERS: self._read_input_registers,
             ModbusCommandsEnum.PRESET_MULTIPLE_REGISTERS: self._preset_multiple_registers
         }[command]
-        # print(f'Processing command {command}')
         response = method_to_call(data)
-        # append CRC16
-        response += self._compute_crc16(response)
+        response += ModbusCommandsProcessor.compute_crc16(response)
         return response
     
 
@@ -95,7 +91,7 @@ class ModbusCommandsProcessor:
         if len(data) != 9 + data_length:
             # raise ValueCapacityError(f'Received data has invalid length, contains {len(data)} bytes: {data}')
             raise ValueCapacityError('Received data has invalid length, contains {} bytes: {}'.format(len(data), data))
-        self._check_crc16(data)
+        ModbusCommandsProcessor.check_crc16(data)
         # write data to registers
         for data_address, reg_address in enumerate(range(start_address, start_address + number_of_registers)):
             self._registers[reg_address] = int.from_bytes(data[7 + data_address * 2: 9 + data_address * 2], 'big')
@@ -111,14 +107,11 @@ class ModbusCommandsProcessor:
         if len(data) != 8:
             # raise ValueError(f'Received data has invalid length, contains {len(data)} bytes: {data}')
             raise ValueError('Received data has invalid length, contains {} bytes: {}'.format(len(data), data))
-        self._check_crc16(data)
-        # print(f'Received data: {data}')
+        ModbusCommandsProcessor.check_crc16(data)
         start_address = int.from_bytes(data[2:4], 'big')
         number_of_registers = int.from_bytes(data[4:6], 'big')
         self._validate_register_address(start_address, number_of_registers)
         response = bytes([self._slave_id, data[1], number_of_registers * 2])
-        # print(bytes([self._slave_id]))
-        # print(f'Response: {response}')
         for reg_address in range(start_address, start_address + number_of_registers):
             reg_value = registers[reg_address]
             if not isinstance(reg_value, bytes):
@@ -137,8 +130,9 @@ class ModbusCommandsProcessor:
                 # raise ValueError(f'Register "{reg_address}" not supported')
                 raise ValueError('Register "{}" not supported'.format(reg_address))
             
-    
-    def _compute_crc16(self, data: bytes) -> bytes:
+
+    @staticmethod
+    def compute_crc16(data: bytes) -> bytes:
         '''
         data: data to compute CRC16
         '''
@@ -151,10 +145,11 @@ class ModbusCommandsProcessor:
                     crc ^= 0xA001
                 else:
                     crc >>= 1
-        return crc.to_bytes(2, 'big')
+        return crc.to_bytes(2, 'little')
     
 
-    def _check_crc16(self, data: bytes) -> bool:
+    @staticmethod
+    def check_crc16(data: bytes) -> bool:
         '''
         data: data to check CRC16
         '''
@@ -162,11 +157,11 @@ class ModbusCommandsProcessor:
             # raise ValueError(f'Received data is too short')
             raise ValueError('Received data is too short')
         crc = int.from_bytes(data[-2:], 'big')
-        return crc == int.from_bytes(self._compute_crc16(data[:-2]), 'big')
+        return crc == int.from_bytes(ModbusCommandsProcessor.compute_crc16(data[:-2]), 'big')
     
-
 class ModbusRTUSlave:
     def __init__(self, port, baudrate=115200, slave_id=9, timeout=1):
+        self._logger = logging.getLogger('modbus_provider')
         self._port = port
         self._baudrate = baudrate
         self._slave_id = slave_id
@@ -189,14 +184,17 @@ class ModbusRTUSlave:
 
     
     def start(self):
-        self._serial = serial.Serial(self._port, self._baudrate, timeout=0)
-        # self._serial.stopbits = serial.STOPBITS_ONE
-        # self._serial.bytesize = serial.EIGHTBITS
-        # self._serial.parity = serial.PARITY_NONE
+        self._serial = serial.Serial(self._port, self._baudrate,
+                parity=serial.PARITY_NONE,
+                bytesize=8,
+                stopbits=1,
+                timeout=0.00175,
+                write_timeout=None,
+                inter_byte_timeout=0.00075,
+        )
         self._is_running = True
         self._cummulitive_data = b''
         self._thread = Thread(target=self._run, daemon=True, name='ModbusRTUSlaveReaderThread')
-        # self._serial.reset_input_buffer()
         self._thread.start()
 
 
@@ -207,33 +205,27 @@ class ModbusRTUSlave:
 
 
     def _run(self):
+        self._serial.reset_input_buffer()
         while self._is_running:
-                # process received data
-            data = self._serial.read(16)
+            data = self._serial.read(8)
             if len(data):
                 if time.time() - self._last_time > self._timeout:
                     self._cummulitive_data = b''
+                self._last_time = time.time()
                 self._cummulitive_data += data
             else:
-                # no data received, sleep for a while
                 time.sleep(0.01)
-
             if len(self._cummulitive_data) >= 8:
                 try:
                     response = self._command_processor.process(self._cummulitive_data)
-                    # print(f'Response: {response} len: {len(response)}')
-                    print('Request: {} len: {}'.format(self._cummulitive_data, len(self._cummulitive_data)))
-                    print('Response: {} len: {}'.format(response, len(response)))
-                    num_bytes = self._serial.write(bytes(response))
+                    self._logger.debug('response: {} len: {}'.format(response, len(response)))
+                    num_bytes = self._serial.write(response)
+                    self._logger.debug('sent: {} len: {}'.format(response, num_bytes))
                     self._serial.flush()
-                    print('Sent {} bytes'.format(num_bytes))
                 except ValueCapacityError as e:
-                    # print(f"value capacity error: {e}")
-                    print('value capacity error: {}'.format(e))
                     continue
                 except ValueError as e:
-                    # print(f'Error processing received data: {e}')
-                    print('Error processing received data: {}'.format(e))
+                    self._logger.warning('error processing received data: {}'.format(e))
                 self._cummulitive_data = b''
             
     
@@ -247,7 +239,6 @@ class ModbusRTUSlave:
         if isinstance(key, Enum):
             key = key.value
         if key not in self._registers.keys():
-            # raise ValueError(f'Register "{key}" not supported')
             raise ValueError('Register "{}" not supported'.format(key))
         self._registers[key] = value
 
@@ -257,7 +248,4 @@ if __name__ == '__main__':
     slave = ModbusRTUSlave('/dev/ttyUSB0')
     slave.start()
     while True:
-        # print(f'action: {slave[RegistersEnum.ACTION_AND_GRIPPER_OPTIONS_1_REGISTER]},\n'
-        #       f'position: {slave[RegistersEnum.GRIPPER_OPTIONS_2_AND_POSITION_REQUEST_REGISTER]},\n'
-        #       f'speed_force: {slave[RegistersEnum.SPEED_AND_FORCE_REQUEST_REGISTER]}')
         time.sleep(1)
